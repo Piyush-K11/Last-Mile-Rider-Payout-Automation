@@ -11,11 +11,15 @@ Then open http://localhost:5000 in a browser.
 To let others on your network use it, opt in explicitly (the default is
 localhost-only, because the app has no login):
     HOST=0.0.0.0 python app.py
+
+Deploying to Vercel: the project directory is read-only there, so all scratch
+files (uploads and generated workbooks) live in the system temp directory.
 """
 import os
 import time
 import uuid
 import zipfile
+import tempfile
 import traceback
 from flask import Flask, render_template, request, send_file, jsonify
 from werkzeug.utils import secure_filename
@@ -24,13 +28,23 @@ from payout_engine import COMPANY_CONFIG, build, preview_summary, build_rate_car
     build_store_mg_flags, store_has_mg, MissingColumnError
 
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
-UPLOAD_DIR = os.path.join(BASE_DIR, 'uploads')
-OUTPUT_DIR = os.path.join(BASE_DIR, 'outputs')
+
+# Vercel (and most serverless hosts) only allow writes under /tmp, so scratch
+# files go in the system temp dir instead of the project folder. Locally this
+# is simply a temp folder too, which is fine because the files are throwaway.
+SCRATCH_DIR = os.path.join(tempfile.gettempdir(), 'payout_converter')
+UPLOAD_DIR = os.path.join(SCRATCH_DIR, 'uploads')
+OUTPUT_DIR = os.path.join(SCRATCH_DIR, 'outputs')
 os.makedirs(UPLOAD_DIR, exist_ok=True)
 os.makedirs(OUTPUT_DIR, exist_ok=True)
 
 app = Flask(__name__)
-app.config['MAX_CONTENT_LENGTH'] = 60 * 1024 * 1024  # 60MB upload cap (shipment files can be large)
+
+# Vercel rejects request bodies above ~4.5 MB before they reach Flask, so cap a
+# little under that there to get a clean error from Flask. Locally, allow 60MB
+# (shipment files can be large).
+ON_VERCEL = bool(os.environ.get('VERCEL'))
+app.config['MAX_CONTENT_LENGTH'] = (4 if ON_VERCEL else 60) * 1024 * 1024
 
 # Only .xlsx is supported: the engine reads workbooks with openpyxl, which can't open the legacy .xls format.
 ALLOWED_EXTENSIONS = ('.xlsx',)
@@ -74,6 +88,13 @@ def error_response(e, fallback_message):
             'found_columns': e.found,
         }), 400
     return jsonify({'error': f'{fallback_message}: {e}'}), 500
+
+
+@app.errorhandler(413)
+def file_too_large(_e):
+    limit_mb = app.config['MAX_CONTENT_LENGTH'] // (1024 * 1024)
+    return jsonify({'error': f'Upload is too large (limit is {limit_mb} MB). '
+                             'Try fewer files at a time or a smaller file.'}), 413
 
 
 @app.route('/')
@@ -258,7 +279,7 @@ if __name__ == '__main__':
     port = int(os.environ.get('PORT', '5000'))
     removed = purge_old_files()
     if removed:
-        print(f'Removed {removed} old file(s) from uploads/ and outputs/')
+        print(f'Removed {removed} old file(s) from the scratch folder')
     if host not in ('127.0.0.1', 'localhost'):
         print(f'WARNING: listening on {host} - anyone on your network can upload files to this app (no login).')
     app.run(host=host, port=port, debug=False)
